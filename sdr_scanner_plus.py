@@ -1,14 +1,10 @@
 #!/usr/bin/env python3
 """
-Receive-only RTL-SDR scanner for authorized RF assessment.
+RTL-SDR CLI Scanner Plus
+Author: Aung Myat Thu
 
-Features:
-- Multi-band scanning with rtl_power
-- Dynamic noise-floor thresholding
-- Peak clustering so one transmission is not shown as many adjacent bins
-- Safe listener process handling: rtl_fm -> aplay
-- CSV logging for red-team/report evidence
-- Blocks listening to protected/emergency guard frequencies by default
+Receive-only SDR scanner.
+Scan frequencies, choose active channel by number, and play audio from CLI.
 
 Requirements:
     sudo apt install rtl-sdr alsa-utils python3
@@ -28,23 +24,23 @@ import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
 
 
 # ================== DEFAULT CONFIG ==================
+
 DEFAULT_GAIN = 40
 DEFAULT_PPM = 0
 DEFAULT_INTEGRATION_SEC = 2
 DEFAULT_THRESHOLD_OFFSET_DB = 12.0
-DEFAULT_MIN_ABSOLUTE_DB = -60.0
-DEFAULT_MAX_RESULTS = 15
+DEFAULT_MIN_DB = -65.0
+DEFAULT_MAX_RESULTS = 20
 DEFAULT_LOG_DIR = "./sdr_logs"
 
-# Keep emergency/protected channels out of interactive listening.
 PROTECTED_FREQS_MHZ = {
     121.500: "Aviation emergency guard frequency",
     243.000: "Military aviation emergency guard frequency",
 }
+
 PROTECTED_TOLERANCE_KHZ = 12.5
 
 
@@ -56,6 +52,7 @@ class BandConfig:
     high_mhz: float
     step_khz: float
     mode: str
+    rtl_rate: int
     audio_rate: int
     note: str = ""
 
@@ -64,41 +61,55 @@ class BandConfig:
 class SignalPeak:
     freq_mhz: float
     db: float
-    threshold_db: float
     noise_floor_db: float
+    threshold_db: float
     protected_reason: str | None = None
 
 
 BANDS: dict[str, BandConfig] = {
     "1": BandConfig(
         key="1",
-        name="Airband AM, authorized receive-only scan",
+        name="FM Broadcast Radio",
+        low_mhz=87.5,
+        high_mhz=108.0,
+        step_khz=100.0,
+        mode="wbfm",
+        rtl_rate=200000,
+        audio_rate=48000,
+        note="Good beginner test band.",
+    ),
+    "2": BandConfig(
+        key="2",
+        name="Airband AM",
         low_mhz=118.0,
         high_mhz=137.0,
         step_khz=25.0,
         mode="am",
+        rtl_rate=48000,
         audio_rate=48000,
-        note="Use only inside your written test scope. Emergency guard is blocked.",
+        note="Use only where legal and authorized. Emergency guard frequency is blocked.",
     ),
-    "2": BandConfig(
-        key="2",
-        name="Authorized UHF land-mobile range",
+    "3": BandConfig(
+        key="3",
+        name="Authorized UHF Land Mobile Range",
         low_mhz=450.0,
         high_mhz=470.0,
         step_khz=12.5,
         mode="fm",
+        rtl_rate=24000,
         audio_rate=24000,
-        note="Confirm the exact local allocation and client-approved frequencies first.",
+        note="Confirm local frequency allocation and written test scope.",
     ),
-    "3": BandConfig(
-        key="3",
-        name="Authorized portable-radio test range",
+    "4": BandConfig(
+        key="4",
+        name="Authorized Portable Radio Test Range",
         low_mhz=462.0,
         high_mhz=468.0,
         step_khz=12.5,
         mode="fm",
+        rtl_rate=24000,
         audio_rate=24000,
-        note="FRS/GMRS-style ranges are jurisdiction-specific. Use only if approved.",
+        note="Jurisdiction-specific. Use only inside approved scope.",
     ),
 }
 
@@ -106,44 +117,26 @@ BANDS: dict[str, BandConfig] = {
 current_audio_procs: list[subprocess.Popen] = []
 
 
-def which_or_none(tool: str) -> str | None:
-    return shutil.which(tool)
+# ================== BASIC HELPERS ==================
 
+def require_tools() -> None:
+    missing = []
 
-def require_scan_tools() -> None:
-    missing = [tool for tool in ["rtl_power", "rtl_fm"] if not which_or_none(tool)]
+    for tool in ["rtl_power", "rtl_fm"]:
+        if not shutil.which(tool):
+            missing.append(tool)
 
     if missing:
-        print(f"❌ Missing required tool(s): {', '.join(missing)}")
-        print("Install RTL-SDR tools first:")
+        print(f"❌ Missing required tools: {', '.join(missing)}")
+        print("Install with:")
         print("  sudo apt install rtl-sdr")
         sys.exit(1)
 
-    if not which_or_none("aplay"):
-        print("⚠️  aplay was not found. Scanning works, but listening will not work.")
-        print("Install it with:")
+    if not shutil.which("aplay"):
+        print("❌ Missing required tool: aplay")
+        print("Install with:")
         print("  sudo apt install alsa-utils")
-
-
-def kill_process_group(proc: subprocess.Popen) -> None:
-    if proc.poll() is not None:
-        return
-
-    try:
-        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-    except ProcessLookupError:
-        pass
-    except Exception as exc:
-        print(f"⚠️  Failed to stop process {proc.pid}: {exc}")
-
-
-def stop_audio() -> None:
-    global current_audio_procs
-
-    for proc in current_audio_procs:
-        kill_process_group(proc)
-
-    current_audio_procs = []
+        sys.exit(1)
 
 
 def protected_reason(freq_mhz: float) -> str | None:
@@ -155,6 +148,32 @@ def protected_reason(freq_mhz: float) -> str | None:
 
     return None
 
+
+def stop_audio() -> None:
+    global current_audio_procs
+
+    for proc in current_audio_procs:
+        if proc.poll() is None:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            except Exception as exc:
+                print(f"⚠️ Failed to stop process {proc.pid}: {exc}")
+
+    current_audio_procs = []
+
+
+def signal_handler(sig, frame) -> None:
+    stop_audio()
+    print("\n🛑 Stopped")
+    sys.exit(0)
+
+
+signal.signal(signal.SIGINT, signal_handler)
+
+
+# ================== SCANNING ==================
 
 def build_rtl_power_cmd(
     cfg: BandConfig,
@@ -186,7 +205,6 @@ def run_rtl_power(
     args: argparse.Namespace,
     output_csv: Path,
 ) -> bool:
-    # Important: rtl_fm and rtl_power cannot use the same dongle together.
     stop_audio()
 
     cmd = build_rtl_power_cmd(cfg, args, output_csv)
@@ -204,22 +222,20 @@ def run_rtl_power(
     except subprocess.CalledProcessError as exc:
         print("❌ rtl_power failed")
 
-        err = (exc.stderr or "").strip()
-        if err:
-            print(err)
+        if exc.stderr:
+            print(exc.stderr.strip())
         else:
-            print("No stderr returned.")
-            print("Check RTL-SDR connection, USB permission, and device busy state.")
+            print("No error message returned.")
 
+        print("\nPossible fixes:")
+        print("  - Check RTL-SDR USB connection")
+        print("  - Run: rtl_test")
+        print("  - Kill old process: pkill rtl_fm rtl_power rtl_tcp")
+        print("  - Check DVB driver blacklist")
         return False
 
 
 def parse_power_csv(path: Path, cfg: BandConfig) -> list[tuple[float, float]]:
-    """
-    Return:
-        [(freq_mhz, db), ...]
-    """
-
     bins: list[tuple[float, float]] = []
 
     try:
@@ -244,21 +260,19 @@ def parse_power_csv(path: Path, cfg: BandConfig) -> list[tuple[float, float]]:
                         bins.append((freq_mhz, db))
 
     except FileNotFoundError:
-        print(f"❌ Scan output not found: {path}")
+        print(f"❌ Missing scan output file: {path}")
 
     return bins
 
 
 def calculate_threshold(
-    db_values: Iterable[float],
+    db_values: list[float],
     args: argparse.Namespace,
 ) -> tuple[float, float]:
-    values = list(db_values)
-
-    if not values:
+    if not db_values:
         return args.min_db, args.min_db
 
-    noise_floor = statistics.median(values)
+    noise_floor = statistics.median(db_values)
     dynamic_threshold = noise_floor + args.threshold_offset
     threshold = max(dynamic_threshold, args.min_db)
 
@@ -268,56 +282,51 @@ def calculate_threshold(
 def cluster_active_bins(
     active_bins: list[tuple[float, float]],
     cfg: BandConfig,
-    threshold_db: float,
-    noise_floor_db: float,
+    noise_floor: float,
+    threshold: float,
 ) -> list[SignalPeak]:
-    """
-    Merge nearby active bins and keep the strongest bin per cluster.
-    """
-
     if not active_bins:
         return []
 
     active_bins.sort(key=lambda item: item[0])
 
-    merge_width_mhz = max(cfg.step_khz * 2.0, cfg.step_khz) / 1000.0
+    merge_width_mhz = max(cfg.step_khz * 2, cfg.step_khz) / 1000.0
 
     clusters: list[list[tuple[float, float]]] = []
-    current_cluster: list[tuple[float, float]] = [active_bins[0]]
+    cluster: list[tuple[float, float]] = [active_bins[0]]
 
     for freq_mhz, db in active_bins[1:]:
-        previous_freq = current_cluster[-1][0]
+        previous_freq = cluster[-1][0]
 
         if freq_mhz - previous_freq <= merge_width_mhz:
-            current_cluster.append((freq_mhz, db))
+            cluster.append((freq_mhz, db))
         else:
-            clusters.append(current_cluster)
-            current_cluster = [(freq_mhz, db)]
+            clusters.append(cluster)
+            cluster = [(freq_mhz, db)]
 
-    clusters.append(current_cluster)
+    clusters.append(cluster)
 
     peaks: list[SignalPeak] = []
 
-    for cluster in clusters:
-        peak_freq, peak_db = max(cluster, key=lambda item: item[1])
+    for item in clusters:
+        peak_freq, peak_db = max(item, key=lambda x: x[1])
 
         peaks.append(
             SignalPeak(
                 freq_mhz=round(peak_freq, 4),
                 db=round(peak_db, 1),
-                threshold_db=round(threshold_db, 1),
-                noise_floor_db=round(noise_floor_db, 1),
+                noise_floor_db=round(noise_floor, 1),
+                threshold_db=round(threshold, 1),
                 protected_reason=protected_reason(peak_freq),
             )
         )
 
     peaks.sort(key=lambda peak: peak.db, reverse=True)
-
     return peaks
 
 
 def scan_band(cfg: BandConfig, args: argparse.Namespace) -> list[SignalPeak]:
-    print(f"\n📡 Scanning: {cfg.name}")
+    print(f"\n📡 Scanning {cfg.name}")
     print(
         f"   Range: {cfg.low_mhz:.3f}-{cfg.high_mhz:.3f} MHz | "
         f"Step: {cfg.step_khz:g} kHz | "
@@ -328,23 +337,23 @@ def scan_band(cfg: BandConfig, args: argparse.Namespace) -> list[SignalPeak]:
         prefix="rtl_power_",
         suffix=".csv",
         delete=False,
-    ) as tmp:
-        tmp_path = Path(tmp.name)
+    ) as tmp_file:
+        tmp_path = Path(tmp_file.name)
 
     try:
-        if not run_rtl_power(cfg, args, tmp_path):
+        ok = run_rtl_power(cfg, args, tmp_path)
+
+        if not ok:
             return []
 
         bins = parse_power_csv(tmp_path, cfg)
 
         if not bins:
-            print("⚠️  No bins parsed from rtl_power output.")
+            print("⚠️ No frequency bins found.")
             return []
 
-        noise_floor, threshold = calculate_threshold(
-            (db for _, db in bins),
-            args,
-        )
+        db_values = [db for _, db in bins]
+        noise_floor, threshold = calculate_threshold(db_values, args)
 
         active_bins = [
             (freq, db)
@@ -353,17 +362,17 @@ def scan_band(cfg: BandConfig, args: argparse.Namespace) -> list[SignalPeak]:
         ]
 
         peaks = cluster_active_bins(
-            active_bins,
-            cfg,
-            threshold,
-            noise_floor,
+            active_bins=active_bins,
+            cfg=cfg,
+            noise_floor=noise_floor,
+            threshold=threshold,
         )
 
-        save_scan_log(cfg, peaks, args)
+        save_log(cfg, peaks, args)
 
         print(
             f"   Noise floor: {noise_floor:.1f} dB | "
-            f"Active threshold: {threshold:.1f} dB"
+            f"Threshold: {threshold:.1f} dB"
         )
 
         return peaks
@@ -375,7 +384,9 @@ def scan_band(cfg: BandConfig, args: argparse.Namespace) -> list[SignalPeak]:
             pass
 
 
-def save_scan_log(
+# ================== LOGGING ==================
+
+def save_log(
     cfg: BandConfig,
     peaks: list[SignalPeak],
     args: argparse.Namespace,
@@ -397,9 +408,9 @@ def save_scan_log(
             writer.writerow(
                 [
                     "timestamp",
-                    "band_key",
-                    "band_name",
-                    "freq_mhz",
+                    "band",
+                    "frequency_mhz",
+                    "mode",
                     "db",
                     "noise_floor_db",
                     "threshold_db",
@@ -411,9 +422,9 @@ def save_scan_log(
             writer.writerow(
                 [
                     now,
-                    cfg.key,
                     cfg.name,
                     f"{peak.freq_mhz:.4f}",
+                    cfg.mode,
                     f"{peak.db:.1f}",
                     f"{peak.noise_floor_db:.1f}",
                     f"{peak.threshold_db:.1f}",
@@ -422,71 +433,40 @@ def save_scan_log(
             )
 
 
-def print_peaks(peaks: list[SignalPeak], args: argparse.Namespace) -> None:
-    print("\n📊 Active channels, strongest first:")
+# ================== AUDIO PLAYBACK ==================
 
-    if not peaks:
-        print(
-            "   None above threshold. Try increasing gain, better antenna, "
-            "longer integration, or lower --threshold-offset."
-        )
-        return
-
-    for idx, peak in enumerate(peaks[: args.max_results], start=1):
-        over = max(0, peak.db - peak.threshold_db)
-        bar = "█" * min(40, int(over / 1.5))
-        lock = " 🔒" if peak.protected_reason else ""
-
-        print(
-            f"  {idx:2d}. {peak.freq_mhz:9.4f} MHz  "
-            f"{peak.db:6.1f} dB  "
-            f"+{over:4.1f} over threshold  {bar}{lock}"
-        )
-
-        if peak.protected_reason:
-            print(f"      Protected: {peak.protected_reason}")
-
-
-def listen_to_frequency(
+def build_rtl_fm_cmd(
     freq_mhz: float,
     cfg: BandConfig,
     args: argparse.Namespace,
-) -> None:
-    reason = protected_reason(freq_mhz)
-
-    if reason:
-        print(f"🚫 Listening blocked for {freq_mhz:.4f} MHz: {reason}")
-        print("   Keep emergency/protected frequencies out of interactive listening.")
-        return
-
-    if not which_or_none("aplay"):
-        print("❌ aplay not installed, cannot listen.")
-        print("Install it with:")
-        print("  sudo apt install alsa-utils")
-        return
-
-    stop_audio()
-
-    rtl_cmd = [
+) -> list[str]:
+    cmd = [
         "rtl_fm",
         "-f",
         str(int(freq_mhz * 1_000_000)),
         "-M",
         cfg.mode,
         "-s",
-        str(cfg.audio_rate),
+        str(cfg.rtl_rate),
         "-g",
         str(args.gain),
         "-p",
         str(args.ppm),
     ]
 
+    # WBFM needs audio resampling for clean playback.
+    if cfg.mode == "wbfm":
+        cmd.extend(["-r", str(cfg.audio_rate)])
+
     if args.device is not None:
-        rtl_cmd.extend(["-d", str(args.device)])
+        cmd.extend(["-d", str(args.device)])
 
-    rtl_cmd.append("-")
+    cmd.append("-")
+    return cmd
 
-    aplay_cmd = [
+
+def build_aplay_cmd(cfg: BandConfig, args: argparse.Namespace) -> list[str]:
+    cmd = [
         "aplay",
         "-r",
         str(cfg.audio_rate),
@@ -498,12 +478,36 @@ def listen_to_frequency(
         "1",
     ]
 
+    if args.audio_device:
+        cmd.extend(["-D", args.audio_device])
+
+    return cmd
+
+
+def play_frequency(
+    freq_mhz: float,
+    cfg: BandConfig,
+    args: argparse.Namespace,
+) -> None:
+    reason = protected_reason(freq_mhz)
+
+    if reason:
+        print(f"\n🚫 Blocked: {freq_mhz:.4f} MHz")
+        print(f"Reason: {reason}")
+        return
+
+    stop_audio()
+
+    rtl_cmd = build_rtl_fm_cmd(freq_mhz, cfg, args)
+    aplay_cmd = build_aplay_cmd(cfg, args)
+
     print(
-        f"\n🎙️  Listening: {freq_mhz:.4f} MHz | "
-        f"{cfg.mode.upper()} | "
-        f"{cfg.audio_rate} Hz"
+        f"\n🎧 Playing {freq_mhz:.4f} MHz | "
+        f"Mode: {cfg.mode.upper()} | "
+        f"Audio: {cfg.audio_rate} Hz"
     )
-    print("   Press Enter or Ctrl+C to stop listening and return to scanner.\n")
+    print("Press Enter to stop and return to scanner.")
+    print("If you are using SSH, audio will play from the SDR machine/uConsole.\n")
 
     global current_audio_procs
 
@@ -516,7 +520,7 @@ def listen_to_frequency(
         )
 
         if rtl_proc.stdout is None:
-            print("❌ Failed to open rtl_fm audio pipe.")
+            print("❌ Could not open rtl_fm audio stream.")
             stop_audio()
             return
 
@@ -531,19 +535,21 @@ def listen_to_frequency(
 
         current_audio_procs = [rtl_proc, aplay_proc]
 
-        try:
-            input()
-        except KeyboardInterrupt:
-            print()
+        input()
+
+    except KeyboardInterrupt:
+        print()
 
     finally:
         stop_audio()
-        print("🔁 Back to scanner")
+        print("🔁 Stopped audio. Back to scanner.")
 
 
-def print_menu() -> None:
-    print("\n🚁 RTL-SDR Multi-Band Scanner Plus")
-    print("Receive-only. Use only for authorized RF assessment. No transmit. No decrypt.\n")
+# ================== UI ==================
+
+def print_main_menu() -> None:
+    print("\n🚀 RTL-SDR CLI Scanner Plus")
+    print("Receive-only scanner. Use only with authorization.\n")
 
     for key, cfg in BANDS.items():
         print(f"{key} = {cfg.name}")
@@ -552,50 +558,83 @@ def print_menu() -> None:
             f"{cfg.step_khz:g} kHz | "
             f"{cfg.mode.upper()}"
         )
-
         if cfg.note:
             print(f"    Note: {cfg.note}")
 
-    print("q = quit")
+    print("q = Quit")
 
 
-def band_loop(cfg: BandConfig, args: argparse.Namespace) -> bool:
+def print_peaks(peaks: list[SignalPeak], args: argparse.Namespace) -> None:
+    print("\n📊 Found Frequencies")
+
+    if not peaks:
+        print("   No active frequency found above threshold.")
+        print("   Try:")
+        print("     --gain 45")
+        print("     --integration 5")
+        print("     --threshold-offset 8")
+        print("     --min-db -75")
+        return
+
+    for idx, peak in enumerate(peaks[: args.max_results], start=1):
+        over = peak.db - peak.threshold_db
+        bar = "█" * min(40, max(0, int(over / 1.5)))
+        lock = " 🔒" if peak.protected_reason else ""
+
+        print(
+            f"  {idx:2d}. {peak.freq_mhz:10.4f} MHz  "
+            f"{peak.db:6.1f} dB  "
+            f"SNR~{peak.db - peak.noise_floor_db:5.1f} dB  "
+            f"{bar}{lock}"
+        )
+
+        if peak.protected_reason:
+            print(f"      Protected: {peak.protected_reason}")
+
+
+def scanner_loop(cfg: BandConfig, args: argparse.Namespace) -> bool:
     while True:
         peaks = scan_band(cfg, args)
         print_peaks(peaks, args)
 
-        print("\n[ number ] = Listen")
-        print("[ Enter ]  = Rescan")
-        print("[ b ]      = Change band")
-        print("[ q ]      = Quit")
+        print("\nChoose action:")
+        print("  [number] = Play/listen to that frequency")
+        print("  [Enter]  = Rescan")
+        print("  b        = Back to band menu")
+        print("  q        = Quit")
 
-        action = input("\n> ").strip().lower()
+        choice = input("\n> ").strip().lower()
 
-        if action == "q":
+        if choice == "q":
             return False
 
-        if action == "b":
+        if choice == "b":
             return True
 
-        if action == "":
+        if choice == "":
             continue
 
-        if action.isdigit():
-            idx = int(action) - 1
+        if choice.isdigit():
+            idx = int(choice) - 1
 
-            if 0 <= idx < min(len(peaks), args.max_results):
-                listen_to_frequency(peaks[idx].freq_mhz, cfg, args)
+            visible_peaks = peaks[: args.max_results]
+
+            if 0 <= idx < len(visible_peaks):
+                selected = visible_peaks[idx]
+                play_frequency(selected.freq_mhz, cfg, args)
             else:
-                print("Invalid number")
+                print("❌ Invalid number.")
 
             continue
 
-        print("Choose Enter, a number, b, or q.")
+        print("❌ Invalid input. Use number, Enter, b, or q.")
 
+
+# ================== ARGUMENTS ==================
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Receive-only RTL-SDR scanner for authorized RF assessment."
+        description="RTL-SDR CLI scanner with numbered frequency playback."
     )
 
     parser.add_argument(
@@ -629,15 +668,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--min-db",
         type=float,
-        default=DEFAULT_MIN_ABSOLUTE_DB,
-        help="Minimum absolute active threshold. Default: -60",
+        default=DEFAULT_MIN_DB,
+        help="Minimum absolute threshold. Default: -65",
     )
 
     parser.add_argument(
         "--max-results",
         type=int,
         default=DEFAULT_MAX_RESULTS,
-        help="Maximum listed peaks. Default: 15",
+        help="Maximum displayed results. Default: 20",
+    )
+
+    parser.add_argument(
+        "--device",
+        type=int,
+        default=None,
+        help="RTL-SDR device index, example: --device 0",
+    )
+
+    parser.add_argument(
+        "--audio-device",
+        default=None,
+        help="Optional ALSA output device, example: --audio-device plughw:0,0",
     )
 
     parser.add_argument(
@@ -653,25 +705,19 @@ def parse_args() -> argparse.Namespace:
         help="Disable CSV logging",
     )
 
-    parser.add_argument(
-        "--device",
-        type=int,
-        default=None,
-        help="RTL-SDR device index, example: --device 0",
-    )
-
     parser.set_defaults(log=True)
 
     return parser.parse_args()
 
 
+# ================== MAIN ==================
+
 def main() -> None:
     args = parse_args()
-    require_scan_tools()
+    require_tools()
 
     while True:
-        print_menu()
-
+        print_main_menu()
         choice = input("\nChoose band: ").strip().lower()
 
         if choice == "q":
@@ -680,22 +726,17 @@ def main() -> None:
         cfg = BANDS.get(choice)
 
         if not cfg:
-            print("Invalid choice.")
+            print("❌ Invalid band.")
             continue
 
-        should_continue = band_loop(cfg, args)
+        keep_running = scanner_loop(cfg, args)
 
-        if not should_continue:
+        if not keep_running:
             break
 
     stop_audio()
-    print("👋 Done. Logs saved in:", Path(args.log_dir).resolve())
+    print("\n👋 Done.")
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        stop_audio()
-        print("\n🛑 Stopped")
-        sys.exit(0)
+    main()
