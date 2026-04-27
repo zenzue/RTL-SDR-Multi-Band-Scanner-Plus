@@ -707,46 +707,6 @@ Testing Limitation: No transmission, interference, decryption, replay, or access
 
 ---
 
-## Suggested `.gitignore`
-
-```gitignore
-# SDR scan logs
-sdr_logs/
-*.csv
-
-# Python
-__pycache__/
-*.pyc
-.venv/
-venv/
-
-# Local notes
-*.log
-.DS_Store
-```
-
-If you want to commit sample CSV evidence, remove `*.csv` and commit only sanitized files.
-
----
-
-## Git Commit
-
-After updating the script and README:
-
-```bash
-git status
-git add sdr_scanner_plus.py README.md
-git commit -m "Upgrade SDR scanner with numbered CLI playback"
-```
-
-Push current branch:
-
-```bash
-git push origin "$(git branch --show-current)"
-```
-
----
-
 ## Limitations
 
 - RTL-SDR is receive-only
